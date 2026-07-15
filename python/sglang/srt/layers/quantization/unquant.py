@@ -166,6 +166,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
+        self.use_hpc_dsl = get_moe_runner_backend().is_hpc_dsl()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
@@ -399,7 +400,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_flashinfer_trtllm_moe:
+        if self.use_hpc_dsl:
+            from sglang.srt.layers.moe.moe_runner.hpc_dsl import (
+                ensure_hpc_dsl_available,
+            )
+
+            ensure_hpc_dsl_available()
+            backend = MoeRunnerBackend.HPC_DSL
+        elif self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -467,7 +475,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         x = dispatch_output.hidden_states
 
         backend = self.runner.runner_backend
-        if backend.is_triton_kernels():
+        if backend.is_hpc_dsl():
+            from sglang.srt.layers.moe.moe_runner.hpc_dsl import HpcDslMoeQuantInfo
+
+            quant_info = HpcDslMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                global_num_experts=layer.num_experts,
+                rank_ep=layer.moe_ep_rank,
+            )
+            return self.runner.run(dispatch_output, quant_info)
+        elif backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
             )

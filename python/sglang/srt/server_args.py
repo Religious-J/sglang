@@ -241,6 +241,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "hpc_dsl",
     "cutlass",
     "aiter",
     "marlin",
@@ -5370,6 +5371,49 @@ class ServerArgs:
             self.disable_shared_experts_fusion = True
             logger.warning(
                 "FlashInfer CuteDSL MoE is enabled. --disable-shared-experts-fusion is automatically set."
+            )
+
+        if self.moe_runner_backend == "hpc_dsl":
+            assert self.quantization is None, (
+                "hpc_dsl currently supports only unquantized BF16 MoE weights; "
+                f"got quantization={self.quantization!r}."
+            )
+            assert self.moe_a2a_backend == "none", (
+                "hpc_dsl currently supports only --moe-a2a-backend none; "
+                f"got {self.moe_a2a_backend!r}."
+            )
+            assert is_sm120_supported(), "hpc_dsl requires an NVIDIA SM120/SM121 GPU."
+            assert not self.enable_eplb, "hpc_dsl does not support EPLB."
+            assert self.init_expert_location == "trivial", (
+                "hpc_dsl requires contiguous expert placement "
+                "(--init-expert-location trivial)."
+            )
+            assert (
+                self.ep_num_redundant_experts == 0
+            ), "hpc_dsl does not support redundant experts."
+            self.disable_shared_experts_fusion = True
+            if (
+                self.cuda_graph_config.prefill.backend != Backend.DISABLED
+                and self.cuda_graph_max_bs_prefill is None
+            ):
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                logger.warning(
+                    "hpc-dsl prefill workspaces are incompatible with SGLang's "
+                    "default multi-shape prefill CUDA graph capture. Prefill CUDA "
+                    "graph is automatically disabled. Set "
+                    "--cuda-graph-max-bs-prefill explicitly to opt in with a "
+                    "bounded capture size."
+                )
+            elif self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+                logger.warning(
+                    "hpc-dsl prefill CUDA graph is explicitly enabled with "
+                    "max_bs=%s. Large values can exhaust GPU memory because "
+                    "hpc-dsl caches one workspace per captured token shape.",
+                    self.cuda_graph_config.prefill.max_bs,
+                )
+            logger.warning(
+                "hpc-dsl MoE is enabled for BF16 SM120. "
+                "--disable-shared-experts-fusion is automatically set."
             )
 
         if self.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:

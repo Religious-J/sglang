@@ -95,6 +95,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    HPC_DSL = "hpc_dsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     AITER = "aiter"
@@ -133,6 +134,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
+
+    def is_hpc_dsl(self):
+        return self == MoeRunnerBackend.HPC_DSL
 
     def is_cutlass(self):
         return self == MoeRunnerBackend.CUTLASS
