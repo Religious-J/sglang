@@ -41,15 +41,6 @@ class HpcDslMoeQuantInfo(MoeQuantInfo):
     weight_format: Optional[str] = None
 
 
-_HPC_DSL_FP8_MMA_MODE = os.getenv("HPC_DSL_FP8_MMA_MODE", "triton").lower()
-if _HPC_DSL_FP8_MMA_MODE not in ("triton", "mxfp8"):
-    raise ValueError("HPC_DSL_FP8_MMA_MODE must be one of: triton, mxfp8")
-
-
-def hpc_dsl_mxfp8_enabled() -> bool:
-    return _HPC_DSL_FP8_MMA_MODE == "mxfp8"
-
-
 def _validate_hpc_dsl_device() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("hpc_dsl requires CUDA.")
@@ -89,52 +80,16 @@ def _load_hpc_dsl_fuse_moe_blockwise_fp8() -> Callable:
     return fuse_moe_blockwise_fp8
 
 
-@lru_cache(maxsize=1)
-def _load_hpc_dsl_mxfp8_api() -> tuple[Callable, Callable, type]:
-    _validate_hpc_dsl_device()
-    os.environ.setdefault("CUTE_DSL_ARCH", "sm_120a")
-    try:
-        from hpc_dsl import (
-            MXFP8MoEWeights,
-            convert_blockwise_fp8_moe_weights_to_mxfp8,
-            fuse_moe_mxfp8,
-        )
-    except ImportError as error:
-        raise RuntimeError(
-            "HPC_DSL_FP8_MMA_MODE=mxfp8 requires an hpc-dsl build that exports "
-            "`fuse_moe_mxfp8` and `convert_blockwise_fp8_moe_weights_to_mxfp8`."
-        ) from error
-    return (
-        fuse_moe_mxfp8,
-        convert_blockwise_fp8_moe_weights_to_mxfp8,
-        MXFP8MoEWeights,
-    )
-
-
-def convert_hpc_dsl_blockwise_fp8_weights(
-    w13_weight: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-):
-    _, convert_weights, _ = _load_hpc_dsl_mxfp8_api()
-    return convert_weights(
-        w13_weight,
-        w2_weight,
-        w13_scale,
-        w2_scale,
-        inplace=True,
-        chunk_rows=512,
-        backend="cute-dsl",
-    )
-
-
 def ensure_hpc_dsl_available(*, blockwise_fp8: bool = False) -> None:
+    legacy_fp8_mode = os.getenv("HPC_DSL_FP8_MMA_MODE", "triton").lower()
+    if legacy_fp8_mode != "triton":
+        raise RuntimeError(
+            "The hpc_dsl native MXFP8 SGLang service path was removed because it "
+            "did not outperform blockwise FP8. Unset HPC_DSL_FP8_MMA_MODE to use "
+            "the retained blockwise FP8 backend."
+        )
     if blockwise_fp8:
-        if hpc_dsl_mxfp8_enabled():
-            _load_hpc_dsl_mxfp8_api()
-        else:
-            _load_hpc_dsl_fuse_moe_blockwise_fp8()
+        _load_hpc_dsl_fuse_moe_blockwise_fp8()
     else:
         _load_hpc_dsl_fuse_moe()
 
@@ -170,17 +125,13 @@ def _validate_tensors(
 
     if hidden_states.dtype != torch.bfloat16:
         raise TypeError(f"hpc_dsl expects BF16 activations, got {hidden_states.dtype}.")
-    uses_bf16 = (
-        w13_weight.dtype == torch.bfloat16 and w2_weight.dtype == torch.bfloat16
-    )
+    uses_bf16 = w13_weight.dtype == torch.bfloat16 and w2_weight.dtype == torch.bfloat16
     uses_blockwise_fp8 = (
         w13_weight.dtype == torch.float8_e4m3fn
         and w2_weight.dtype == torch.float8_e4m3fn
     )
     if not uses_bf16 and not uses_blockwise_fp8:
-        raise TypeError(
-            "hpc_dsl expects both expert weights to use BF16 or FP8 E4M3."
-        )
+        raise TypeError("hpc_dsl expects both expert weights to use BF16 or FP8 E4M3.")
     if hidden_states.ndim != 2 or w13_weight.ndim != 3 or w2_weight.ndim != 3:
         raise ValueError("hpc_dsl expects x=[M,H], w13=[E,2I,H], w2=[E,H,I].")
     num_local_experts, gate_up_size, hidden_size = w13_weight.shape
@@ -198,41 +149,14 @@ def _validate_tensors(
     )
     weight_format = quant_info.weight_format
     if weight_format is None:
-        weight_format = "blockwise_fp8" if quant_info.block_shape is not None else "bf16"
-    if weight_format not in ("bf16", "blockwise_fp8", "mxfp8"):
+        weight_format = (
+            "blockwise_fp8" if quant_info.block_shape is not None else "bf16"
+        )
+    if weight_format not in ("bf16", "blockwise_fp8"):
         raise ValueError(f"unsupported hpc_dsl weight format {weight_format!r}.")
     if uses_bf16 and weight_format != "bf16":
         raise ValueError("BF16 hpc_dsl weights require weight_format='bf16'.")
-    if uses_blockwise_fp8 and weight_format == "mxfp8":
-        if quant_info.block_shape is not None or any(
-            scale is None for scale in scale_tensors
-        ):
-            raise ValueError(
-                "hpc_dsl MXFP8 requires derived scales and no source block_shape."
-            )
-        w13_scale = quant_info.w13_weight_scale_inv
-        w2_scale = quant_info.w2_weight_scale_inv
-        if w13_scale.dtype != torch.uint8 or w2_scale.dtype != torch.uint8:
-            raise TypeError("hpc_dsl MXFP8 scales must use uint8 UE8M0 bytes.")
-        expected_w13_scale_shape = (
-            num_local_experts,
-            gate_up_size * hidden_size // 32,
-        )
-        expected_w2_scale_shape = (
-            num_local_experts,
-            hidden_size * intermediate_size // 32,
-        )
-        if tuple(w13_scale.shape) != expected_w13_scale_shape:
-            raise ValueError(
-                "hpc_dsl MXFP8 w13 scale shape must be "
-                f"{expected_w13_scale_shape}, got {tuple(w13_scale.shape)}."
-            )
-        if tuple(w2_scale.shape) != expected_w2_scale_shape:
-            raise ValueError(
-                "hpc_dsl MXFP8 w2 scale shape must be "
-                f"{expected_w2_scale_shape}, got {tuple(w2_scale.shape)}."
-            )
-    elif uses_blockwise_fp8 and weight_format == "blockwise_fp8":
+    if uses_blockwise_fp8 and weight_format == "blockwise_fp8":
         if quant_info.block_shape is None or any(
             scale is None for scale in scale_tensors
         ):
@@ -324,39 +248,7 @@ def fused_experts_none_to_hpc_dsl(
     output = torch.empty_like(dispatch_output.hidden_states)
     topk_ids = topk_output.topk_ids.to(dtype=torch.int32).contiguous()
     topk_weights = topk_output.topk_weights.to(dtype=torch.float32).contiguous()
-    weight_format = quant_info.weight_format
-    if weight_format is None:
-        weight_format = "blockwise_fp8" if quant_info.block_shape is not None else "bf16"
-    if weight_format == "mxfp8":
-        fuse_moe_mxfp8, _, weights_type = _load_hpc_dsl_mxfp8_api()
-        intermediate_size = quant_info.w13_weight.shape[1] // 2
-        weights = weights_type(
-            gate_up=quant_info.w13_weight,
-            gate_up_scale=quant_info.w13_weight_scale_inv,
-            down=quant_info.w2_weight,
-            down_scale=quant_info.w2_weight_scale_inv,
-            hidden_size=dispatch_output.hidden_states.shape[1],
-            intermediate_size=intermediate_size,
-        )
-        workspace_slot = None
-        if dispatch_output.hidden_states.is_cuda:
-            workspace_slot = (
-                "sglang",
-                torch.cuda.current_stream(
-                    dispatch_output.hidden_states.device
-                ).cuda_stream,
-            )
-        output = fuse_moe_mxfp8(
-            dispatch_output.hidden_states,
-            weights,
-            topk_ids,
-            topk_weights,
-            quant_info.rank_ep,
-            quant_info.global_num_experts,
-            out=output,
-            workspace_slot=workspace_slot,
-        )
-    elif quant_info.block_shape is not None:
+    if quant_info.block_shape is not None:
         output = _load_hpc_dsl_fuse_moe_blockwise_fp8()(
             dispatch_output.hidden_states,
             quant_info.w13_weight,

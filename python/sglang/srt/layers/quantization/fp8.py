@@ -1156,46 +1156,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
-        if get_moe_runner_backend().is_hpc_dsl():
-            from sglang.srt.layers.moe.moe_runner.hpc_dsl import (
-                convert_hpc_dsl_blockwise_fp8_weights,
-                hpc_dsl_mxfp8_enabled,
-            )
-
-            if hpc_dsl_mxfp8_enabled():
-                if getattr(layer, "_hpc_mxfp8_ready", False):
-                    return
-                layer._hpc_mxfp8_ready = False
-                converted = convert_hpc_dsl_blockwise_fp8_weights(
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    layer.w13_weight_scale_inv,
-                    layer.w2_weight_scale_inv,
-                )
-
-                def _store_derived_scale(name: str, value: torch.Tensor) -> None:
-                    current = getattr(layer, name, None)
-                    if current is None:
-                        layer.register_buffer(name, value, persistent=False)
-                        return
-                    if (
-                        current.shape != value.shape
-                        or current.dtype != value.dtype
-                        or current.device != value.device
-                    ):
-                        raise RuntimeError(
-                            f"cannot rebind address-stable hpc_dsl MXFP8 buffer {name}"
-                        )
-                    current.copy_(value)
-
-                _store_derived_scale(
-                    "_hpc_mxfp8_w13_scale", converted.gate_up_scale
-                )
-                _store_derived_scale("_hpc_mxfp8_w2_scale", converted.down_scale)
-                torch.cuda.synchronize(layer.w13_weight.device)
-                layer._hpc_mxfp8_ready = True
-                return
-
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -1884,39 +1844,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             getattr(self, "runner", None) is not None
             and self.runner.runner_backend.is_hpc_dsl()
         ):
-            from sglang.srt.layers.moe.moe_runner.hpc_dsl import (
-                HpcDslMoeQuantInfo,
-                hpc_dsl_mxfp8_enabled,
-            )
-
-            use_mxfp8 = hpc_dsl_mxfp8_enabled()
-            if use_mxfp8 and not getattr(layer, "_hpc_mxfp8_ready", False):
-                raise RuntimeError(
-                    "hpc_dsl MXFP8 weights are not ready; the payload may have "
-                    "been reloaded and cannot fall back to blockwise FP8"
-                )
+            from sglang.srt.layers.moe.moe_runner.hpc_dsl import HpcDslMoeQuantInfo
 
             quant_info = HpcDslMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
-                w13_weight_scale_inv=(
-                    layer._hpc_mxfp8_w13_scale
-                    if use_mxfp8
-                    else layer.w13_weight_scale_inv
-                ),
-                w2_weight_scale_inv=(
-                    layer._hpc_mxfp8_w2_scale
-                    if use_mxfp8
-                    else layer.w2_weight_scale_inv
-                ),
-                block_shape=(
-                    None
-                    if use_mxfp8
-                    else tuple(self.quant_config.weight_block_size)
-                ),
-                weight_format="mxfp8" if use_mxfp8 else "blockwise_fp8",
+                w13_weight_scale_inv=layer.w13_weight_scale_inv,
+                w2_weight_scale_inv=layer.w2_weight_scale_inv,
+                block_shape=tuple(self.quant_config.weight_block_size),
+                weight_format="blockwise_fp8",
                 global_num_experts=layer.num_experts,
                 rank_ep=layer.moe_ep_rank,
             )

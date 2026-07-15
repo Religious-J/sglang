@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +7,7 @@ import torch
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.hpc_dsl import (
     HpcDslMoeQuantInfo,
+    ensure_hpc_dsl_available,
     fused_experts_none_to_hpc_dsl,
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
@@ -41,6 +43,11 @@ class TestHpcDslBackend(unittest.TestCase):
 
     def test_backend_enum(self):
         self.assertTrue(MoeRunnerBackend("hpc_dsl").is_hpc_dsl())
+
+    def test_rejects_retired_native_mxfp8_service_mode(self):
+        with patch.dict(os.environ, {"HPC_DSL_FP8_MMA_MODE": "mxfp8"}):
+            with self.assertRaisesRegex(RuntimeError, "service path was removed"):
+                ensure_hpc_dsl_available(blockwise_fp8=True)
 
     def test_fused_adapter_converts_routing_and_provides_output(self):
         workspace_output = torch.ones(3, 8, dtype=torch.bfloat16)
@@ -181,7 +188,7 @@ class TestHpcDslBackend(unittest.TestCase):
                 self.dispatch_output, quant_info, MoeRunnerConfig()
             )
 
-    def test_fused_adapter_supports_native_mxfp8(self):
+    def test_rejects_native_mxfp8_service_format(self):
         hidden_states = torch.randn(3, 128, dtype=torch.bfloat16)
         dispatch_output = StandardDispatchOutput(
             hidden_states=hidden_states,
@@ -202,67 +209,7 @@ class TestHpcDslBackend(unittest.TestCase):
             rank_ep=0,
         )
 
-        class FakeWeights:
-            def __init__(self, **kwargs):
-                self.__dict__.update(kwargs)
-
-        def fake_fuse(
-            x,
-            weights,
-            topk_ids,
-            topk_weights,
-            rank_ep,
-            num_experts,
-            *,
-            out,
-            workspace_slot,
-        ):
-            self.assertIs(x, hidden_states)
-            self.assertIs(weights.gate_up, w13_weight)
-            self.assertIs(weights.gate_up_scale, w13_scale)
-            self.assertIs(weights.down, w2_weight)
-            self.assertIs(weights.down_scale, w2_scale)
-            self.assertEqual(weights.hidden_size, 128)
-            self.assertEqual(weights.intermediate_size, 128)
-            self.assertEqual(topk_ids.dtype, torch.int32)
-            self.assertEqual(topk_weights.dtype, torch.float32)
-            self.assertEqual(rank_ep, 0)
-            self.assertEqual(num_experts, 4)
-            self.assertIsNone(workspace_slot)
-            out.fill_(5)
-            return out
-
-        with patch(
-            "sglang.srt.layers.moe.moe_runner.hpc_dsl._load_hpc_dsl_mxfp8_api",
-            return_value=(fake_fuse, None, FakeWeights),
-        ):
-            result = fused_experts_none_to_hpc_dsl(
-                dispatch_output, quant_info, MoeRunnerConfig()
-            )
-
-        torch.testing.assert_close(
-            result.hidden_states,
-            torch.full_like(result.hidden_states, 5.0),
-        )
-
-    def test_rejects_invalid_mxfp8_scale_shape(self):
-        hidden_states = torch.randn(3, 128, dtype=torch.bfloat16)
-        dispatch_output = StandardDispatchOutput(
-            hidden_states=hidden_states,
-            hidden_states_scale=None,
-            topk_output=self.dispatch_output.topk_output,
-        )
-        quant_info = HpcDslMoeQuantInfo(
-            w13_weight=torch.zeros(4, 256, 128, dtype=torch.float8_e4m3fn),
-            w2_weight=torch.zeros(4, 128, 128, dtype=torch.float8_e4m3fn),
-            w13_weight_scale_inv=torch.zeros(4, 1023, dtype=torch.uint8),
-            w2_weight_scale_inv=torch.zeros(4, 512, dtype=torch.uint8),
-            weight_format="mxfp8",
-            global_num_experts=4,
-            rank_ep=0,
-        )
-
-        with self.assertRaisesRegex(ValueError, "MXFP8 w13 scale shape"):
+        with self.assertRaisesRegex(ValueError, "unsupported hpc_dsl weight format"):
             fused_experts_none_to_hpc_dsl(
                 dispatch_output, quant_info, MoeRunnerConfig()
             )

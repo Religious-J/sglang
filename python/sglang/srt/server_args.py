@@ -5393,14 +5393,8 @@ class ServerArgs:
                 self.ep_num_redundant_experts == 0
             ), "hpc_dsl does not support redundant experts."
             self.disable_shared_experts_fusion = True
-            uses_native_mxfp8 = (
-                self.quantization == "fp8"
-                and os.getenv("HPC_DSL_FP8_MMA_MODE", "triton").lower()
-                == "mxfp8"
-            )
             if (
-                not uses_native_mxfp8
-                and self.cuda_graph_config.prefill.backend != Backend.DISABLED
+                self.cuda_graph_config.prefill.backend != Backend.DISABLED
                 and self.cuda_graph_max_bs_prefill is None
             ):
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
@@ -5412,21 +5406,12 @@ class ServerArgs:
                     "bounded capture size."
                 )
             elif self.cuda_graph_config.prefill.backend != Backend.DISABLED:
-                if uses_native_mxfp8:
-                    logger.warning(
-                        "hpc-dsl native MXFP8 prefill CUDA graph is enabled with "
-                        "max_bs=%s. Capture runs largest-to-smallest so serialized "
-                        "graphs share one graph-external high-watermark workspace.",
-                        self.cuda_graph_config.prefill.max_bs,
-                    )
-                else:
-                    logger.warning(
-                        "hpc-dsl prefill CUDA graph is explicitly enabled with "
-                        "max_bs=%s. Large values can exhaust GPU memory because "
-                        "the legacy path caches one workspace per captured token "
-                        "shape.",
-                        self.cuda_graph_config.prefill.max_bs,
-                    )
+                logger.warning(
+                    "hpc-dsl prefill CUDA graph is explicitly enabled with "
+                    "max_bs=%s. Large values can exhaust GPU memory because "
+                    "the backend caches one workspace per captured token shape.",
+                    self.cuda_graph_config.prefill.max_bs,
+                )
             logger.warning(
                 "hpc-dsl MoE is enabled for BF16 or blockwise FP8 on SM120. "
                 "--disable-shared-experts-fusion is automatically set."
