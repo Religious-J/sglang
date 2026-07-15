@@ -1156,6 +1156,46 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if get_moe_runner_backend().is_hpc_dsl():
+            from sglang.srt.layers.moe.moe_runner.hpc_dsl import (
+                convert_hpc_dsl_blockwise_fp8_weights,
+                hpc_dsl_mxfp8_enabled,
+            )
+
+            if hpc_dsl_mxfp8_enabled():
+                if getattr(layer, "_hpc_mxfp8_ready", False):
+                    return
+                layer._hpc_mxfp8_ready = False
+                converted = convert_hpc_dsl_blockwise_fp8_weights(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale_inv,
+                    layer.w2_weight_scale_inv,
+                )
+
+                def _store_derived_scale(name: str, value: torch.Tensor) -> None:
+                    current = getattr(layer, name, None)
+                    if current is None:
+                        layer.register_buffer(name, value, persistent=False)
+                        return
+                    if (
+                        current.shape != value.shape
+                        or current.dtype != value.dtype
+                        or current.device != value.device
+                    ):
+                        raise RuntimeError(
+                            f"cannot rebind address-stable hpc_dsl MXFP8 buffer {name}"
+                        )
+                    current.copy_(value)
+
+                _store_derived_scale(
+                    "_hpc_mxfp8_w13_scale", converted.gate_up_scale
+                )
+                _store_derived_scale("_hpc_mxfp8_w2_scale", converted.down_scale)
+                torch.cuda.synchronize(layer.w13_weight.device)
+                layer._hpc_mxfp8_ready = True
+                return
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -1779,12 +1819,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
+        if moe_runner_backend.is_hpc_dsl():
+            if (
+                not self.quant_config.is_checkpoint_fp8_serialized
+                or not self.block_quant
+                or self.quant_config.activation_scheme != "dynamic"
+                or tuple(self.quant_config.weight_block_size) != (128, 128)
+            ):
+                raise ValueError(
+                    "hpc_dsl supports only serialized dynamic FP8 MoE checkpoints "
+                    "with weight_block_size=[128, 128]."
+                )
+            from sglang.srt.layers.moe.moe_runner.hpc_dsl import (
+                ensure_hpc_dsl_available,
+            )
+
+            ensure_hpc_dsl_available(blockwise_fp8=True)
+
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
+            or moe_runner_backend.is_hpc_dsl()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -1821,6 +1879,48 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        if (
+            getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_hpc_dsl()
+        ):
+            from sglang.srt.layers.moe.moe_runner.hpc_dsl import (
+                HpcDslMoeQuantInfo,
+                hpc_dsl_mxfp8_enabled,
+            )
+
+            use_mxfp8 = hpc_dsl_mxfp8_enabled()
+            if use_mxfp8 and not getattr(layer, "_hpc_mxfp8_ready", False):
+                raise RuntimeError(
+                    "hpc_dsl MXFP8 weights are not ready; the payload may have "
+                    "been reloaded and cannot fall back to blockwise FP8"
+                )
+
+            quant_info = HpcDslMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                w13_weight_scale_inv=(
+                    layer._hpc_mxfp8_w13_scale
+                    if use_mxfp8
+                    else layer.w13_weight_scale_inv
+                ),
+                w2_weight_scale_inv=(
+                    layer._hpc_mxfp8_w2_scale
+                    if use_mxfp8
+                    else layer.w2_weight_scale_inv
+                ),
+                block_shape=(
+                    None
+                    if use_mxfp8
+                    else tuple(self.quant_config.weight_block_size)
+                ),
+                weight_format="mxfp8" if use_mxfp8 else "blockwise_fp8",
+                global_num_experts=layer.num_experts,
+                rank_ep=layer.moe_ep_rank,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu

@@ -772,6 +772,8 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        if hasattr(self, "_hpc_mxfp8_ready"):
+            self._hpc_mxfp8_ready = False
         tp_rank = self.moe_tp_rank
 
         # Special case for GGUF weights
