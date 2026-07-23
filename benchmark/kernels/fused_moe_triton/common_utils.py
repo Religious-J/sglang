@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from typing import Dict, List, TypedDict
 
 import torch
+from typing_extensions import NotRequired
 
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
@@ -12,6 +13,22 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_config
 
 
+class BlockwiseFp8GemmConfig(TypedDict, total=False):
+    block_n: int
+    block_k: int
+    num_warps: int
+    num_stages: int
+
+
+class BlockwiseFp8MoeConfig(TypedDict, total=False):
+    profile: str
+    direct: bool
+    block_m: int
+    gate_num_groups: int
+    gate: BlockwiseFp8GemmConfig
+    down: BlockwiseFp8GemmConfig
+
+
 class BenchmarkConfig(TypedDict):
     BLOCK_SIZE_M: int
     BLOCK_SIZE_N: int
@@ -19,6 +36,10 @@ class BenchmarkConfig(TypedDict):
     GROUP_SIZE_M: int
     num_warps: int
     num_stages: int
+    waves_per_eu: NotRequired[int]
+    USE_TMA: NotRequired[bool]
+    USE_BLOCKWISE_FP8_MOE: NotRequired[bool]
+    BLOCKWISE_FP8_MOE_CONFIG: NotRequired[BlockwiseFp8MoeConfig]
 
 
 def calculate_shard_intermediate_size(
@@ -206,7 +227,7 @@ def get_model_config(
     }
 
 
-def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
+def get_rocm_configs_compute_bound() -> List[BenchmarkConfig]:
     configs: List[BenchmarkConfig] = []
     waves_per_eu_range = 0
     for num_stages in [2]:
@@ -229,7 +250,7 @@ def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
     return configs
 
 
-def get_configs_compute_bound() -> List[Dict[str, int]]:
+def get_configs_compute_bound() -> List[BenchmarkConfig]:
     configs: List[BenchmarkConfig] = []
     if is_hip():
         configs = get_rocm_configs_compute_bound()
@@ -265,6 +286,14 @@ def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
             {"waves_per_eu": config["waves_per_eu"]} if "waves_per_eu" in config else {}
         ),
         **({"USE_TMA": config["USE_TMA"]} if "USE_TMA" in config else {}),
+        **(
+            {
+                "USE_BLOCKWISE_FP8_MOE": True,
+                "BLOCKWISE_FP8_MOE_CONFIG": config.get("BLOCKWISE_FP8_MOE_CONFIG", {}),
+            }
+            if config.get("USE_BLOCKWISE_FP8_MOE", False)
+            else {}
+        ),
     }
 
 

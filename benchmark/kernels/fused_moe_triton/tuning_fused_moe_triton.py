@@ -6,13 +6,14 @@ import json
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Dict, List, Tuple
+from typing import Any, List, Tuple
 
 import ray
 import torch
 import triton
 from common_utils import (
     BenchmarkConfig,
+    BlockwiseFp8MoeConfig,
     get_config_filename,
     get_configs_compute_bound,
     get_default_batch_sizes,
@@ -29,17 +30,181 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config impor
     get_config_dtype_str,
     get_default_config,
     get_moe_configs,
+    is_blockwise_fp8_moe_batch_size_supported,
 )
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import get_device, is_hip, is_xpu
-from sglang.srt.utils.hf_transformers_utils import get_config
+from sglang.srt.utils import get_device, is_hip, is_sm120_supported, is_xpu
 
 _is_hip = is_hip()
+_is_sm120 = is_sm120_supported()
 _is_xpu = is_xpu()
+_BLOCKWISE_FP8_MOE_MIN_SPEEDUP = 1.01
+
+
+def _make_benchmark_moe_runner_config(
+    num_experts: int,
+    ep_size: int,
+    architecture: str,
+) -> MoeRunnerConfig:
+    """Build one production-equivalent runner config for every candidate."""
+    all_experts_local = ep_size == 1
+    return MoeRunnerConfig(
+        inplace=True,
+        swiglu_limit=10.0 if architecture == "DeepseekV4ForCausalLM" else None,
+        num_experts=num_experts if all_experts_local else None,
+        num_local_experts=num_experts if all_experts_local else None,
+    )
+
+
+def _can_tune_blockwise_fp8_moe(
+    num_tokens: int,
+    num_experts: int,
+    shard_intermediate_size: int,
+    hidden_size: int,
+    topk: int,
+    dtype: torch.dtype,
+    use_fp8_w8a8: bool,
+    per_channel_quant: bool,
+    block_shape: List[int],
+    ep_size: int,
+    architecture: str,
+) -> bool:
+    return (
+        torch.cuda.is_available()
+        and torch.version.cuda is not None
+        and _is_sm120
+        and ep_size == 1
+        and architecture != "DeepseekV4ForCausalLM"
+        and use_fp8_w8a8
+        and dtype == torch.bfloat16
+        and not per_channel_quant
+        and block_shape == [128, 128]
+        and hidden_size % 128 == 0
+        and (shard_intermediate_size // 2) % 128 == 0
+        and is_blockwise_fp8_moe_batch_size_supported(num_tokens)
+        and num_tokens * topk <= num_experts
+    )
+
+
+def _get_blockwise_fp8_moe_profiles(
+    hidden_size: int,
+    intermediate_size: int,
+    num_pairs: int,
+) -> List[Tuple[str, BlockwiseFp8MoeConfig]]:
+    """Return at most eight legal end-to-end fast-path profiles."""
+    down_latency = {
+        "block_n": 32 if intermediate_size <= 1024 else 64,
+        "block_k": 128,
+        "num_warps": 4,
+        "num_stages": 1 if intermediate_size <= 1024 else 4,
+    }
+    profiles: List[Tuple[str, BlockwiseFp8MoeConfig]] = [("auto", {})]
+
+    # Direct routing stops paying off once the route set is large enough to
+    # amortize alignment. Keep these profiles below the measured 64-pair
+    # boundary; larger batches only compare the automatic/aligned schedules.
+    if num_pairs < 64:
+        profiles.append(
+            (
+                "direct_unsplit",
+                {
+                    "direct": True,
+                    "gate_num_groups": 1,
+                    "gate": {
+                        "block_n": 64,
+                        "block_k": 128,
+                        "num_warps": 4,
+                        "num_stages": 4,
+                    },
+                    "down": down_latency,
+                },
+            )
+        )
+
+    num_k_blocks = hidden_size // 128
+    if num_pairs <= 32:
+        for groups in (2, 4, 8):
+            if num_k_blocks % groups == 0 and 4 <= num_k_blocks // groups <= 32:
+                profiles.append(
+                    (
+                        f"direct_split_{groups}",
+                        {
+                            "direct": True,
+                            "gate_num_groups": groups,
+                            "down": down_latency,
+                        },
+                    )
+                )
+
+    if num_pairs < 64:
+        profiles.append(
+            (
+                "direct_balanced",
+                {
+                    "direct": True,
+                    "gate": {
+                        "block_n": 128,
+                        "block_k": 128,
+                        "num_warps": 4,
+                        "num_stages": 3,
+                    },
+                    "down": {
+                        "block_n": 64,
+                        "block_k": 128,
+                        "num_warps": 4,
+                        "num_stages": 2,
+                    },
+                },
+            )
+        )
+
+    profiles.extend(
+        [
+            (
+                "aligned_m16",
+                {
+                    "direct": False,
+                    "block_m": 16,
+                    "gate": {
+                        "block_n": 64,
+                        "block_k": 128,
+                        "num_warps": 4,
+                        "num_stages": 4,
+                    },
+                    "down": {
+                        "block_n": 128,
+                        "block_k": 128,
+                        "num_warps": 4,
+                        "num_stages": 2,
+                    },
+                },
+            ),
+            (
+                "aligned_m32_wide",
+                {
+                    "direct": False,
+                    "block_m": 32,
+                    "gate": {
+                        "block_n": 128,
+                        "block_k": 128,
+                        "num_warps": 8,
+                        "num_stages": 2,
+                    },
+                    "down": {
+                        "block_n": 128,
+                        "block_k": 128,
+                        "num_warps": 8,
+                        "num_stages": 2,
+                    },
+                },
+            ),
+        ]
+    )
+    return profiles[:8]
 
 
 def benchmark_config(
@@ -57,6 +222,8 @@ def benchmark_config(
     per_channel_quant: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
+    ep_size: int = 1,
+    architecture: str = "",
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
@@ -176,12 +343,10 @@ def benchmark_config(
         topk_output.router_logits.copy_(new_topk_output.router_logits)
 
     def run():
-        model_config = get_config(args.model, trust_remote_code=True)
-        architecture = model_config.architectures[0]
-        is_dsv4 = architecture == "DeepseekV4ForCausalLM"
-        moe_runner_config = MoeRunnerConfig(
-            inplace=True,
-            swiglu_limit=10.0 if is_dsv4 else None,
+        moe_runner_config = _make_benchmark_moe_runner_config(
+            num_experts,
+            ep_size,
+            architecture,
         )
 
         with override_config(config):
@@ -243,10 +408,12 @@ def benchmark_config(
 
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
-    def __init__(self, seed: int, server_args: ServerArgs) -> None:
+    def __init__(self, seed: int, server_args: ServerArgs, architecture: str) -> None:
         torch.set_default_device(get_device())
         torch.get_device_module().manual_seed_all(0)
         self.seed = seed
+        self.ep_size = server_args.ep_size
+        self.architecture = architecture
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU. Ray isolates each worker to a single visible
         # GPU via CUDA_VISIBLE_DEVICES, so the local ordinal is always 0. On
@@ -268,7 +435,7 @@ class BenchmarkWorker:
         use_int4_w4a16: bool,
         per_channel_quant: bool,
         block_shape: List[int],
-    ) -> Tuple[Dict[str, int], float]:
+    ) -> Tuple[BenchmarkConfig, float]:
         torch.cuda.manual_seed_all(0)
         dtype_str = get_config_dtype_str(
             dtype,
@@ -319,6 +486,8 @@ class BenchmarkWorker:
                 use_int4_w4a16,
                 per_channel_quant,
                 block_shape,
+                ep_size=self.ep_size,
+                architecture=self.architecture,
             )
         return config, kernel_time
 
@@ -336,8 +505,9 @@ class BenchmarkWorker:
         use_int4_w4a16: bool,
         per_channel_quant: bool,
         block_shape: List[int],
-        search_space: List[Dict[str, int]],
-    ) -> Dict[str, int]:
+        search_space: List[BenchmarkConfig],
+        architecture: str = "",
+    ) -> BenchmarkConfig:
         best_config = None
         best_time = float("inf")
         with (
@@ -362,6 +532,8 @@ class BenchmarkWorker:
                         per_channel_quant,
                         block_shape,
                         num_iters=10,
+                        ep_size=self.ep_size,
+                        architecture=architecture,
                     )
                 except (triton.runtime.autotuner.OutOfResources, RuntimeError):
                     # Some configurations may be invalid and fail to compile.
@@ -370,9 +542,149 @@ class BenchmarkWorker:
                 if kernel_time < best_time:
                     best_time = kernel_time
                     best_config = config
-        now = datetime.now()
-        print(f"{now.ctime()}] Completed tuning for batch_size={num_tokens}")
+
         assert best_config is not None
+        if _can_tune_blockwise_fp8_moe(
+            num_tokens,
+            num_experts,
+            shard_intermediate_size,
+            hidden_size,
+            topk,
+            dtype,
+            use_fp8_w8a8,
+            per_channel_quant,
+            block_shape,
+            self.ep_size,
+            architecture,
+        ):
+            candidate_seed = self.seed + num_tokens
+            best_candidate_config = None
+            best_candidate_time = float("inf")
+            best_profile_name = None
+            tuning_errors = (
+                triton.runtime.autotuner.OutOfResources,
+                triton.errors.TritonError,
+                RuntimeError,
+            )
+            for profile_name, profile in _get_blockwise_fp8_moe_profiles(
+                hidden_size,
+                shard_intermediate_size // 2,
+                num_tokens * topk,
+            ):
+                candidate_config = {
+                    **best_config,
+                    "USE_BLOCKWISE_FP8_MOE": True,
+                    "BLOCKWISE_FP8_MOE_CONFIG": {
+                        "profile": profile_name,
+                        **profile,
+                    },
+                }
+                try:
+                    torch.cuda.manual_seed_all(candidate_seed)
+                    candidate_time = benchmark_config(
+                        candidate_config,
+                        num_tokens,
+                        num_experts,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a8,
+                        use_int8_w8a16,
+                        use_int4_w4a16,
+                        per_channel_quant,
+                        block_shape,
+                        num_iters=10,
+                        ep_size=self.ep_size,
+                        architecture=architecture,
+                    )
+                except tuning_errors as error:
+                    print(
+                        "Skipping blockwise FP8 MoE profile "
+                        f"{profile_name!r} for batch_size={num_tokens}: {error}"
+                    )
+                    continue
+
+                print(
+                    "Blockwise FP8 MoE profile "
+                    f"{profile_name!r}, batch_size={num_tokens}: "
+                    f"{candidate_time:.2f} us"
+                )
+                if candidate_time < best_candidate_time:
+                    best_candidate_time = candidate_time
+                    best_candidate_config = candidate_config
+                    best_profile_name = profile_name
+
+            if best_candidate_config is not None:
+                try:
+                    torch.cuda.manual_seed_all(candidate_seed)
+                    generic_time = benchmark_config(
+                        best_config,
+                        num_tokens,
+                        num_experts,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a8,
+                        use_int8_w8a16,
+                        use_int4_w4a16,
+                        per_channel_quant,
+                        block_shape,
+                        num_iters=100,
+                        ep_size=self.ep_size,
+                        architecture=architecture,
+                    )
+                    torch.cuda.manual_seed_all(candidate_seed)
+                    candidate_time = benchmark_config(
+                        best_candidate_config,
+                        num_tokens,
+                        num_experts,
+                        shard_intermediate_size,
+                        hidden_size,
+                        topk,
+                        dtype,
+                        use_fp8_w8a8,
+                        use_int8_w8a8,
+                        use_int8_w8a16,
+                        use_int4_w4a16,
+                        per_channel_quant,
+                        block_shape,
+                        num_iters=100,
+                        ep_size=self.ep_size,
+                        architecture=architecture,
+                    )
+                    speedup = generic_time / candidate_time
+                    if speedup >= _BLOCKWISE_FP8_MOE_MIN_SPEEDUP:
+                        best_config = best_candidate_config
+                        best_time = candidate_time
+                        print(
+                            "Selected blockwise FP8 MoE profile "
+                            f"{best_profile_name!r} for batch_size={num_tokens}: "
+                            f"{generic_time:.2f} us -> {candidate_time:.2f} us "
+                            f"({speedup:.3f}x)"
+                        )
+                    else:
+                        best_time = generic_time
+                        print(
+                            "Kept generic Triton MoE for "
+                            f"batch_size={num_tokens}: generic={generic_time:.2f} us, "
+                            f"best blockwise FP8 profile={candidate_time:.2f} us "
+                            f"({speedup:.3f}x; need "
+                            f"{_BLOCKWISE_FP8_MOE_MIN_SPEEDUP:.3f}x)"
+                        )
+                except tuning_errors as error:
+                    print(
+                        "Skipping final blockwise FP8 MoE comparison for "
+                        f"batch_size={num_tokens}: {error}"
+                    )
+        now = datetime.now()
+        print(
+            f"{now.ctime()}] Completed tuning for batch_size={num_tokens}, "
+            f"best_time={best_time:.2f} us"
+        )
         return best_config
 
 
@@ -407,7 +719,14 @@ def main(args: argparse.Namespace):
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)]
+    workers = [
+        BenchmarkWorker.remote(
+            args.seed,
+            server_args,
+            model_config["architecture"],
+        )
+        for _ in range(num_gpus)
+    ]
 
     def _distribute(method: str, inputs: List[Any]) -> List[Any]:
         outputs = []
@@ -475,6 +794,7 @@ def main(args: argparse.Namespace):
                     per_channel_quant,
                     block_shape,
                     search_space,
+                    model_config["architecture"],
                 )
                 for batch_size in batch_sizes
             ],

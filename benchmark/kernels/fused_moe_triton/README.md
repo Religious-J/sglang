@@ -15,6 +15,11 @@ The tuning tools support both **Tensor Parallelism (TP)** and **Expert Paralleli
 #### 1. `tuning_fused_moe_triton.py`
 A unified tool for tuning the `fused_moe_triton` kernel. Adapted from [vllm's benchmark_moe.py](https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py), with support for EP mode and various model architectures.
 
+On SM120/SM121 with EP=1, BF16 activations, and 128x128 blockwise FP8 weights,
+the tuner considers the fast path for requested token counts up to 16 and
+persists it only when it is at least 1% faster. Runtime requires an exact-M
+winner.
+
 #### 2. `tuning_fused_moe_triton_sep.py`
 A specialized tool for separate kernel tuning, optimizing the first and second MoE kernels independently with TMA (Tensor Memory Accelerator) support.
 
@@ -152,6 +157,10 @@ After tuning, configuration files will be generated:
 - **Separate kernel tuning**: Two files for up/down kernels with TMA optimization flags
 
 Move these files to `sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_version/` directory to use them in SGLang.
+
+Fast-path winners use `"USE_BLOCKWISE_FP8_MOE": true`, with profile parameters
+stored in `"BLOCKWISE_FP8_MOE_CONFIG"`. Set `SGLANG_BLOCKWISE_FP8_MOE=0` to
+disable the path.
 
 ### Supported Models
 

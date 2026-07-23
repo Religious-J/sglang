@@ -36,12 +36,18 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_musa,
+    is_sm120_supported,
     is_xpu,
     use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
-from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
+from .fused_moe_triton_config import (
+    get_config_dtype_str,
+    get_tuned_blockwise_fp8_moe_config,
+    is_blockwise_fp8_moe_batch_size_supported,
+    try_get_optimal_moe_config,
+)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -55,12 +61,186 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
+_is_sm120 = is_sm120_supported()
+_use_blockwise_fp8_moe = envs.SGLANG_BLOCKWISE_FP8_MOE.get()
+
+
+def _is_blockwise_fp8_moe_runtime_policy_enabled(num_tokens: int, topk: int) -> bool:
+    """Return whether runtime policy allows the tuned fast path."""
+    return (
+        _is_cuda
+        and _is_sm120
+        and _use_blockwise_fp8_moe
+        and is_blockwise_fp8_moe_batch_size_supported(num_tokens)
+        and not (get_server_args().enable_fused_moe_sum_all_reduce and topk > 2)
+    )
+
+
+def _get_blockwise_fp8_moe_config(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    b1: Optional[torch.Tensor],
+    b2: Optional[torch.Tensor],
+    inplace: bool,
+    activation: str,
+    is_gated: bool,
+    apply_router_weight_on_input: bool,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    w1_scale: Optional[torch.Tensor],
+    w2_scale: Optional[torch.Tensor],
+    block_shape: Optional[List[int]],
+    no_combine: bool,
+    routed_scaling_factor: Optional[float],
+    gemm1_alpha: Optional[float],
+    gemm1_limit: Optional[float],
+    filter_expert: bool,
+    swiglu_limit: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    """Return the tuned profile when the blockwise-FP8 path is eligible."""
+
+    del inplace  # Both out-of-place and final-write-in-place are supported.
+    if hidden_states.ndim != 2 or topk_ids.ndim != 2:
+        return None
+    if not _is_blockwise_fp8_moe_runtime_policy_enabled(
+        hidden_states.shape[0], topk_ids.shape[1]
+    ):
+        return None
+    if (
+        hidden_states.device.type != "cuda"
+        or not use_fp8_w8a8
+        or use_int8_w8a8
+        or use_int8_w8a16
+        or use_int4_w4a16
+        or per_channel_quant
+        or tuple(block_shape or ()) != (128, 128)
+        or filter_expert
+        or activation != "silu"
+        or not is_gated
+        or apply_router_weight_on_input
+        or no_combine
+        or routed_scaling_factor not in (None, 1.0)
+        or gemm1_alpha is not None
+        or gemm1_limit is not None
+        or swiglu_limit is not None
+        or b1 is not None
+        or b2 is not None
+        or hidden_states.dtype != torch.bfloat16
+        or w1.dtype != torch.float8_e4m3fn
+        or w2.dtype != torch.float8_e4m3fn
+        or topk_ids.dtype != torch.int32
+        or topk_weights.dtype != torch.float32
+        or w1_scale is None
+        or w2_scale is None
+        or w1_scale.dtype != torch.float32
+        or w2_scale.dtype != torch.float32
+    ):
+        return None
+
+    if any(
+        not tensor.is_contiguous()
+        for tensor in (
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            topk_weights,
+            w1_scale,
+            w2_scale,
+        )
+    ):
+        return None
+    if any(
+        tensor.device != hidden_states.device
+        for tensor in (w1, w2, topk_ids, topk_weights, w1_scale, w2_scale)
+    ):
+        return None
+
+    num_tokens, hidden = hidden_states.shape
+    experts, gate_up, weight_hidden = w1.shape
+    if (
+        num_tokens <= 0
+        or hidden != weight_hidden
+        or gate_up % 2
+        or hidden % 128
+        or (gate_up // 2) % 128
+        or topk_ids.shape != topk_weights.shape
+        or topk_ids.shape[0] != num_tokens
+        or topk_ids.numel() > experts
+    ):
+        return None
+
+    intermediate = gate_up // 2
+    if (
+        w2.shape != (experts, hidden, intermediate)
+        or w1_scale.shape != (experts, gate_up // 128, hidden // 128)
+        or w2_scale.shape != (experts, hidden // 128, intermediate // 128)
+    ):
+        return None
+
+    config_dtype = get_config_dtype_str(
+        dtype=hidden_states.dtype,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+    )
+    return get_tuned_blockwise_fp8_moe_config(
+        w2.shape,
+        config_dtype,
+        num_tokens,
+        block_shape=block_shape,
+        per_channel_quant=per_channel_quant,
+    )
+
+
+def _run_blockwise_fp8_moe(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    inplace: bool,
+    tuning_config: Dict[str, Any],
+) -> torch.Tensor:
+    hidden_fp8, hidden_scale = sglang_per_token_group_quant_fp8(hidden_states, 128)
+    return fuse_moe_blockwise_fp8(
+        hidden_fp8,
+        hidden_scale,
+        w1,
+        w1_scale,
+        w2,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        rank_ep=0,
+        num_expert_total=w1.shape[0],
+        output=hidden_states if inplace else None,
+        tuning_config=tuning_config,
+    )
 
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+
+    if _is_sm120 and _use_blockwise_fp8_moe:
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        from .blockwise_fp8_moe.fused_moe import fuse_moe_blockwise_fp8
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -883,6 +1063,47 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+    blockwise_fp8_config = _get_blockwise_fp8_moe_config(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        b1=b1,
+        b2=b2,
+        inplace=inplace,
+        activation=activation,
+        is_gated=is_gated,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        block_shape=block_shape,
+        no_combine=no_combine,
+        routed_scaling_factor=routed_scaling_factor,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        filter_expert=filter_expert,
+        swiglu_limit=swiglu_limit,
+    )
+    if blockwise_fp8_config is not None:
+        assert w1_scale is not None and w2_scale is not None
+        return _run_blockwise_fp8_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            inplace=inplace,
+            tuning_config=blockwise_fp8_config,
+        )
 
     (
         config,

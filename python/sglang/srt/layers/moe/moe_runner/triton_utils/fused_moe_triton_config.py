@@ -15,6 +15,28 @@ from sglang.srt.utils import get_device_name, is_hip
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES = 128 * 1024
+_BLOCKWISE_FP8_MOE_MAX_TOKENS = 16
+
+
+def is_blockwise_fp8_moe_batch_size_supported(M: int) -> bool:
+    """Return whether the tuned fast path supports this token count."""
+    return 0 < M <= _BLOCKWISE_FP8_MOE_MAX_TOKENS
+
+
+def _kernel_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a persisted config while removing algorithm-selection metadata."""
+    config = dict(config)
+    config.pop("USE_BLOCKWISE_FP8_MOE", None)
+    config.pop("BLOCKWISE_FP8_MOE_CONFIG", None)
+    return config
+
+
+def _warn_invalid_blockwise_fp8_moe_config(name: str, value_repr: str) -> None:
+    logger.warning_once(
+        "Ignoring invalid %s=%s; expected a JSON object.",
+        name,
+        value_repr,
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -136,8 +158,12 @@ def get_moe_configs(
                 logger.warning(
                     f"Config file not found at {config_file_path}. Fallback to triton version {try_triton_version} and use MoE kernel config from {try_config_file_path}. Performance might be sub-optimal!",
                 )
-                # If a configuration has been found, return it
-                return {int(key): val for key, val in json.load(f).items()}
+                # Generic tile parameters can safely use the existing fallback
+                # behavior. Algorithm-selection metadata is only valid for the
+                # Triton version that benchmarked and persisted it.
+                return {
+                    int(key): _kernel_config(val) for key, val in json.load(f).items()
+                }
 
     if down_moe:
         # A separate down-projection config enables the TMA path, but it is
@@ -175,6 +201,76 @@ def get_moe_configs(
             config_file_path,
         )
     return None
+
+
+def get_tuned_blockwise_fp8_moe_config(
+    w2_shape: Tuple[int, ...],
+    dtype: Optional[str],
+    M: int,
+    block_shape: Optional[List[int]] = None,
+    per_channel_quant: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Return the selected blockwise FP8 profile, or ``None`` when disabled."""
+    from sglang.srt.layers.moe.moe_runner.triton_utils import get_config
+
+    if not is_blockwise_fp8_moe_batch_size_supported(M):
+        return None
+
+    config = get_config()
+    if config is None:
+        E, _, N = w2_shape
+        block_n = block_shape[0] if block_shape else 0
+        block_k = block_shape[1] if block_shape else 0
+        configs = get_moe_configs(
+            E,
+            N,
+            dtype,
+            block_n,
+            block_k,
+            per_channel_quant=per_channel_quant,
+            down_moe=False,
+        )
+        if not configs:
+            return None
+        # Generic Triton tile parameters use nearest-M selection, but switching
+        # algorithms requires an exact benchmark result for this token count.
+        config = configs.get(M)
+        if config is None:
+            return None
+
+    if not isinstance(config, dict):
+        _warn_invalid_blockwise_fp8_moe_config("MoE config", repr(config))
+        return None
+    if config.get("USE_BLOCKWISE_FP8_MOE") is not True:
+        return None
+    tuning_config = config.get("BLOCKWISE_FP8_MOE_CONFIG", {})
+    if not isinstance(tuning_config, dict):
+        _warn_invalid_blockwise_fp8_moe_config(
+            "BLOCKWISE_FP8_MOE_CONFIG",
+            repr(tuning_config),
+        )
+        return None
+    return dict(tuning_config)
+
+
+def use_tuned_blockwise_fp8_moe(
+    w2_shape: Tuple[int, ...],
+    dtype: Optional[str],
+    M: int,
+    block_shape: Optional[List[int]] = None,
+    per_channel_quant: bool = False,
+) -> bool:
+    """Return whether offline tuning selected the blockwise FP8 MoE path."""
+    return (
+        get_tuned_blockwise_fp8_moe_config(
+            w2_shape,
+            dtype,
+            M,
+            block_shape=block_shape,
+            per_channel_quant=per_channel_quant,
+        )
+        is not None
+    )
 
 
 def get_default_config(
@@ -317,10 +413,11 @@ def try_get_optimal_moe_config(
                 down_config = down_configs[
                     min(down_configs.keys(), key=lambda x: abs(x - M))
                 ]
-                down_config = dict(**down_config)
+                down_config = _kernel_config(down_config)
                 max_block_m = max(
                     [cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()]
                 )
+    config = _kernel_config(config)
     if return_down_config:
         if (
             down_config is not None

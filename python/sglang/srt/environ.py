@@ -727,6 +727,7 @@ class Envs:
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
+    SGLANG_BLOCKWISE_FP8_MOE = EnvBool(True)
     SGLANG_RETURN_ORIGINAL_LOGPROB = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
