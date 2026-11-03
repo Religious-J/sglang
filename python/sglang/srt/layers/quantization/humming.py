@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -542,6 +543,11 @@ class HummingConfig(QuantizationConfig):
     def __init__(self, full_config: dict[str, Any] | None = None):
         _lazy_import_humming()
         self.full_config: dict[str, Any] = full_config or {}
+        self.kv_cache_scheme = (
+            self.full_config.get("kv_cache_scheme")
+            if self.full_config.get("quant_method") == "compressed-tensors"
+            else None
+        )
         self._w4afp8_config = None
         if self.full_config.get("quant_method") == "w4afp8":
             from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
@@ -567,6 +573,22 @@ class HummingConfig(QuantizationConfig):
             else self.full_config.get("weight_block_size")
         )
         self.is_fp4_experts: bool = False
+
+    @property
+    def kv_cache_quant_algo(self) -> str | None:
+        # Keep auto KV dtype resolution aligned with the calibrated scales
+        # registered on RadixAttention, using the checkpoint format's validator.
+        kv_cache_scheme = getattr(self, "kv_cache_scheme", None)
+        if kv_cache_scheme is None:
+            return None
+
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsKVCacheMethod,
+        )
+
+        if CompressedTensorsKVCacheMethod.is_supported_scheme(kv_cache_scheme):
+            return "FP8"
+        return None
 
     @classmethod
     def get_name(cls) -> str:
@@ -765,6 +787,13 @@ class HummingConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        if isinstance(layer, RadixAttention):
+            if self.kv_cache_quant_algo is None:
+                return None
+            return BaseKVCacheMethod(self)
+
         layer_type = "other"
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
