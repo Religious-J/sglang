@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
@@ -44,6 +45,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A16Mxfp4,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
@@ -62,6 +64,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -174,6 +177,19 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        if isinstance(layer, RadixAttention):
+            if self.kv_cache_scheme is None:
+                return None
+            if not CompressedTensorsKVCacheMethod.is_supported_scheme(
+                self.kv_cache_scheme
+            ):
+                raise NotImplementedError(
+                    "Compressed-tensors KV cache requires static symmetric per-tensor FP8."
+                )
+            return CompressedTensorsKVCacheMethod(self)
+
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
@@ -247,6 +263,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             quant_format=quant_format,
             sparsity_scheme_map=sparsity_scheme_map,
             sparsity_ignore_list=sparsity_ignore_list,
+            kv_cache_scheme=config.get("kv_cache_scheme"),
             config=config,
             packed_modules_mapping=packed_modules_mapping,
             linear_fp8_config=linear_fp8_config,
@@ -304,7 +321,10 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
 
                 target_scheme_map[target]["input_activations"] = None
-                if is_activation_quantization_format(quant_format):
+                if (
+                    is_activation_quantization_format(quant_format)
+                    or quant_format == "mxfp4-pack-quantized"
+                ):
                     input_activations = quant_config.get("input_activations")
                     # The only case where we have activation quant supported
                     # but no input_activations provided in the config
@@ -545,6 +565,51 @@ class CompressedTensorsConfig(QuantizationConfig):
     def _get_scheme_from_parts(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> CompressedTensorsLinearScheme:
+
+        # MXFP4 E2M1 weights with raw E8M0 group scales. Dispatch before
+        # generic group quantization, which otherwise treats W4A16 as integer.
+        if (
+            weight_quant is not None
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 4
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size == 32
+            and weight_quant.symmetric
+            and not weight_quant.dynamic
+        ):
+            if not _is_cuda:
+                raise NotImplementedError("MXFP4 Marlin linear requires CUDA.")
+            backend = os.environ.get("SGLANG_CT_MXFP4_BACKEND", "marlin")
+            if backend == "humming":
+                from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a8_mxfp4_humming import (
+                    CompressedTensorsW4A8Mxfp4Humming,
+                )
+
+                self._check_scheme_supported(
+                    CompressedTensorsW4A8Mxfp4Humming.get_min_capability()
+                )
+                logger.warning_once(
+                    "Serving MXFP4 dense linears via Humming W4A8: MXFP4 "
+                    "weights, dynamic E4M3 FP8 activations, BF16 outputs. "
+                    "Checkpoint activation quantization is replaced."
+                )
+                return CompressedTensorsW4A8Mxfp4Humming(
+                    has_input_activations=input_quant is not None,
+                    actorder=weight_quant.actorder,
+                )
+            if backend != "marlin":
+                raise ValueError(f"Unknown SGLANG_CT_MXFP4_BACKEND: {backend}")
+            self._check_scheme_supported(
+                CompressedTensorsW4A16Mxfp4.get_min_capability()
+            )
+            if input_quant is not None:
+                logger.warning_once(
+                    "Serving MXFP4 checkpoint with BF16 activations via Marlin "
+                    "(W4A16); checkpoint activation quantization is ignored."
+                )
+            return CompressedTensorsW4A16Mxfp4(
+                has_input_activations=input_quant is not None
+            )
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
@@ -916,6 +981,27 @@ class CompressedTensorsConfig(QuantizationConfig):
             return False
 
         return weight_quant.num_bits == input_quant.num_bits == 8
+
+
+class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):
+    """Load calibrated k_scale / v_scale from a compressed-tensors checkpoint
+    that declares a ``kv_cache_scheme`` (static per-tensor FP8)."""
+
+    def __init__(self, quant_config: CompressedTensorsConfig):
+        assert self.is_supported_scheme(quant_config.kv_cache_scheme)
+        super().__init__(quant_config)
+
+    @staticmethod
+    def is_supported_scheme(kv_cache_scheme: Dict[str, Any]) -> bool:
+        """Static symmetric per-tensor FP8 — all BaseKVCacheMethod can
+        represent. Dynamic schemes serialize no k_scale/v_scale tensors."""
+        return (
+            kv_cache_scheme.get("type") == "float"
+            and kv_cache_scheme.get("num_bits") == 8
+            and kv_cache_scheme.get("strategy") == "tensor"
+            and kv_cache_scheme.get("symmetric", True)
+            and not kv_cache_scheme.get("dynamic", False)
+        )
 
 
 class CompressedTensorsLinearMethod(LinearMethodBase):

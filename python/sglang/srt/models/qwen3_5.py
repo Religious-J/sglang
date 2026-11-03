@@ -73,6 +73,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
@@ -774,6 +775,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=f"{prefix}.attn",
+            quant_config=quant_config,
         )
 
         # Dense MLP for non-MoE variant
@@ -1589,6 +1591,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if name.endswith((".k_scale", ".v_scale")):
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
@@ -1656,6 +1662,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                     weight_loader(param_lm_head, loaded_weight)
             loaded_params.add(name)
+        kv_scale_count = sum(
+            n.endswith((".attn.k_scale", ".attn.v_scale")) for n in loaded_params
+        )
+        if kv_scale_count:
+            logger.info("Loaded %d calibrated FP8 KV cache scales", kv_scale_count)
         return loaded_params
 
 

@@ -61,7 +61,7 @@ def fake_apply_fp4_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor | None,
     workspace: torch.Tensor,
     size_n: int,
     size_k: int,
@@ -78,7 +78,7 @@ def apply_fp4_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_global_scale: torch.Tensor,
+    weight_global_scale: torch.Tensor | None,
     workspace: torch.Tensor,
     size_n: int,
     size_k: int,
@@ -178,6 +178,61 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         assert layer.bias.shape == (part_size_n,)
         bias = marlin_permute_bias(layer.bias)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+
+
+def prepare_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
+    group_size = 32
+    if getattr(layer, "quant_config", None) is not None:
+        configured = layer.quant_config.group_size
+        if configured != group_size:
+            raise ValueError(
+                f"MXFP4 Marlin requires group_size={group_size}, got {configured}."
+            )
+
+    part_size_n = layer.output_size_per_partition
+    part_size_k = layer.input_size_per_partition
+    param_dtype = getattr(layer, "params_dtype", getattr(layer, "orig_dtype", None))
+    # The E8M0 scale decoder is only instantiated for bf16; see marlin/dequant.h.
+    if param_dtype != torch.bfloat16:
+        raise RuntimeError("MXFP4 Marlin requires BF16 activation dtype.")
+
+    assert layer.weight.shape == (part_size_n, part_size_k // 2)
+
+    # This backport uses the existing unpadded Marlin apply path. Fail early
+    # on unsupported TP shard dimensions instead of silently changing shapes.
+    if part_size_n % 64 or part_size_k % 128:
+        raise ValueError(
+            "MXFP4 Marlin on this branch requires N divisible by 64 and K "
+            f"divisible by 128; got N={part_size_n}, K={part_size_k}."
+        )
+    padded_size_n, padded_size_k = part_size_n, part_size_k
+
+    device = layer.weight.device
+    layer.workspace = marlin_make_workspace(device)
+
+    perm = torch.empty(0, dtype=torch.int, device=device)
+    qweight = layer.weight.view(torch.int32).T.contiguous()
+    marlin_qweight = gptq_marlin_repack(
+        b_q_weight=qweight,
+        perm=perm,
+        size_k=padded_size_k,
+        size_n=padded_size_n,
+        num_bits=4,
+    )
+    layer.weight = torch.nn.Parameter(marlin_qweight, requires_grad=False)
+
+    # Scales are raw E8M0 exponent bytes: reinterpret rather than convert, then
+    # permute and repack in the same order as prepare_moe_mxfp4_layer_for_marlin.
+    weight_scale = _normalize_scale_tensor(layer.weight_scale, param_dtype)
+    weight_scale = weight_scale.T.contiguous()
+    weight_scale = marlin_permute_scales(
+        s=weight_scale,
+        size_k=padded_size_k,
+        size_n=padded_size_n,
+        group_size=group_size,
+    )
+    weight_scale = mxfp4_marlin_process_scales(weight_scale, input_dtype=param_dtype)
+    layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
 
 
 def mxfp4_marlin_process_scales(
